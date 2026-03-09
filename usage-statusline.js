@@ -8,13 +8,13 @@ const os = require('os');
 const path = require('path');
 
 const CACHE_FILE = path.join(os.tmpdir(), 'claude-usage-cache.json');
-const CACHE_TTL_MS = 5 * 60_000; // 5 minutes — usage data changes slowly
+const CACHE_TTL_MS = 15 * 60_000; // 15 minutes — usage data changes slowly
 
 function readCache(stale) {
   try {
     const raw = fs.readFileSync(CACHE_FILE, 'utf8');
     const cached = JSON.parse(raw);
-    if (stale || Date.now() - cached.ts < CACHE_TTL_MS) return cached.data;
+    if (stale || Date.now() - cached.ts < CACHE_TTL_MS) return cached;
   } catch {}
   return null;
 }
@@ -22,6 +22,16 @@ function readCache(stale) {
 function writeCache(data) {
   try {
     fs.writeFileSync(CACHE_FILE, JSON.stringify({ ts: Date.now(), data }));
+  } catch {}
+}
+
+function touchCache() {
+  // On 429, bump timestamp so we don't retry for another TTL cycle
+  try {
+    const raw = fs.readFileSync(CACHE_FILE, 'utf8');
+    const cached = JSON.parse(raw);
+    cached.ts = Date.now();
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(cached));
   } catch {}
 }
 
@@ -41,6 +51,16 @@ function formatReset(resetAt) {
   return h > 0 ? `${h}h${m}m` : `${m}m`;
 }
 
+function formatAge(tsMs) {
+  const diffMs = Date.now() - tsMs;
+  if (diffMs < 60_000) return '<1m';
+  const m = Math.floor(diffMs / 60_000);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return remM > 0 ? `${h}h${remM}m` : `${h}h`;
+}
+
 function bar(pct) {
   // Color: green < 50, yellow < 80, red >= 80
   if (pct >= 80) return `\x1b[31m${pct}%\x1b[0m`;
@@ -58,7 +78,8 @@ async function fetchUsage() {
     const creds = JSON.parse(fs.readFileSync(credPath, 'utf8'));
     token = creds.claudeAiOauth.accessToken;
   } catch {
-    return readCache(true); // serve stale on credential error
+    const stale = readCache(true);
+    return stale || null;
   }
 
   try {
@@ -70,12 +91,18 @@ async function fetchUsage() {
       },
       signal: AbortSignal.timeout(3000)
     });
-    if (!resp.ok) return readCache(true); // serve stale on 429 or other errors
+    if (!resp.ok) {
+      touchCache(); // bump timestamp so we wait another TTL before retrying
+      const stale = readCache(true);
+      return stale || null;
+    }
     const data = await resp.json();
     writeCache(data);
-    return data;
+    return { ts: Date.now(), data };
   } catch {
-    return readCache(true); // serve stale on network error
+    touchCache();
+    const stale = readCache(true);
+    return stale || null;
   }
 }
 
@@ -89,12 +116,13 @@ async function main() {
     setTimeout(resolve, 2000);
   });
 
-  const usage = await fetchUsage();
-  if (!usage) {
+  const result = await fetchUsage();
+  if (!result || !result.data) {
     process.stdout.write('');
     return;
   }
 
+  const { ts, data: usage } = result;
   const parts = [];
 
   // 5-hour session
@@ -115,6 +143,18 @@ async function main() {
   if (usage.seven_day_sonnet) {
     const pct = Math.round(usage.seven_day_sonnet.utilization);
     parts.push(`son:${bar(pct)}`);
+  }
+
+  // Age indicator — how old the data is
+  if (ts) {
+    const age = formatAge(ts);
+    // Dim if fresh (<15m), yellow if stale (>30m), red if very stale (>1h)
+    const ageMs = Date.now() - ts;
+    let ageColor;
+    if (ageMs > 3_600_000) ageColor = '\x1b[31m';      // red >1h
+    else if (ageMs > 1_800_000) ageColor = '\x1b[33m';  // yellow >30m
+    else ageColor = '\x1b[2m';                            // dim = fresh
+    parts.push(`${ageColor}${age} ago\x1b[0m`);
   }
 
   process.stdout.write(parts.join(' │ '));
